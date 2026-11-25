@@ -15,10 +15,7 @@ L'appel a l'API audio utilise la cle MISTRAL_API_KEY si elle est presentee
 worker. Aucune cle n'est stockee dans le depot.
 """
 
-import base64
 import logging
-import os
-import tempfile
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -58,6 +55,7 @@ class AudioOut(BaseModel):
 
 def _make_client():
     from mistralai.client import Mistral
+    import os
 
     api_key = os.environ.get("MISTRAL_API_KEY")
     if api_key:
@@ -67,6 +65,9 @@ def _make_client():
 
 def _google_credentials():
     """Charge les credentials Google du service account, ou None si absents."""
+    import os
+    import tempfile
+
     try:
         from google.oauth2 import service_account
     except ImportError:
@@ -101,6 +102,8 @@ def _drive_filename(note_id: str) -> str:
 
 def _upload_to_drive(mp3_b64: str, filename: str, folder_id: str, creds: Any) -> str:
     """Televerse le MP3 dans le dossier Drive et retourne l'identifiant du fichier."""
+    import base64
+
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaInMemoryUpload
 
@@ -113,6 +116,23 @@ def _upload_to_drive(mp3_b64: str, filename: str, folder_id: str, creds: Any) ->
         .execute()
     )
     return created["id"]
+
+
+@workflows.activity()
+async def resolve_upload_mode(folder_id: str | None) -> str | None:
+    """Retourne le dossier Drive si l'upload est possible, sinon None.
+
+    Doit rester une ACTIVITE : elle lit l'environnement et importe la
+    librairie Google, ce que le sandbox deterministe du workflow interdit.
+    """
+    if not folder_id:
+        return None
+    if _google_credentials() is None:
+        logger.warning(
+            "drive_folder_id fourni mais credentials Google absents : sortie base64"
+        )
+        return None
+    return folder_id
 
 
 @workflows.activity()
@@ -152,21 +172,14 @@ async def upload_note(audio: AudioOut, folder_id: str) -> AudioOut:
 )
 class TTSNotesWorkflow:
     @workflows.workflow.entrypoint
-    async def run(self, input: TTSNotesInput) -> list[AudioOut]:
-        upload_mode = False
-        target_folder = input.drive_folder_id
-        if target_folder and _google_credentials() is not None:
-            upload_mode = True
-        elif target_folder:
-            logger.warning(
-                "drive_folder_id fourni mais credentials Google absents : sortie base64"
-            )
-            target_folder = None
+    async def run(self, input: TTSNotesInput) -> "list[AudioOut]":
+        # Le mode Drive se resout via une ACTIVITE (imports/env interdits dans le workflow).
+        target_folder: str | None = await resolve_upload_mode(input.drive_folder_id)
 
         results: list[AudioOut] = []
         for note in input.notes:
             audio = await synthesize_note(note, input.voice_id, input.model)
-            if upload_mode and target_folder:
+            if target_folder:
                 uploaded = await upload_note(audio, target_folder)
                 # Ne pas renvoyer le base64 dans le resultat (economie de taille)
                 results.append(
