@@ -5,14 +5,15 @@ dispose des credentials Google (GOOGLE_APPLICATION_CREDENTIALS_JSON ou
 GOOGLE_APPLICATION_CREDENTIALS), chaque MP3 est televerse directement dans
 ce dossier Drive et le resultat ne contient plus de base64 (leger).
 
-Entree : la voix (voice_id Voxtral), une liste de notes (id + texte deja
-verbalise), et optionnellement drive_folder_id (dossier Drive cible).
-Sortie : par note, soit {id, filename, drive_file_id, chars} (mode Drive),
-soit {id, mp3_base64, chars} (mode retrocompatible, sans drive_folder_id).
+Un compte de service Google n'a aucun quota Drive : le fichier est donc
+cree vide, la propriete est transferee a owner_email (qui doit avoir acces
+au dossier), PUIS le contenu audio est charge (quota du vrai proprietaire).
 
-L'appel a l'API audio utilise la cle MISTRAL_API_KEY si elle est presentee
-(secret workspace lie au deployment), sinon le token de service-account du
-worker. Aucune cle n'est stockee dans le depot.
+Entree : la voix (voice_id Voxtral), une liste de notes (id + texte deja
+verbalise), drive_folder_id (dossier Drive cible) et owner_email
+(proprietaire Drive final des MP3).
+Sortie : par note {id, filename, drive_file_id, chars}, ou {id, mp3_base64,
+chars} en mode retrocompatible (sans drive_folder_id).
 """
 
 import logging
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "voxtral-mini-tts-3-0"
 DEFAULT_VOICE = "voice_592"  # Marie (fr), voix Voxtral 3
 MP3_MIME = "audio/mpeg"
-DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 
 
 class NoteIn(BaseModel):
@@ -39,9 +40,10 @@ class TTSNotesInput(BaseModel):
     notes: list[NoteIn]
     voice_id: str = Field(default=DEFAULT_VOICE, description="Identifiant de la voix Voxtral")
     model: str = Field(default=DEFAULT_MODEL, description="Modele TTS")
-    drive_folder_id: str | None = Field(
+    drive_folder_id: str | None = Field(default=None)
+    owner_email: str | None = Field(
         default=None,
-        description="Identifiant du dossier Google Drive ou televerser les MP3. Si absent, la sortie reste en base64 (retrocompatible).",
+        description="Compte Drive a qui transferer la propriete des MP3 (un compte de service n'a aucun quota).",
     )
 
 
@@ -54,8 +56,9 @@ class AudioOut(BaseModel):
 
 
 def _make_client():
-    from mistralai.client import Mistral
     import os
+
+    from mistralai.client import Mistral
 
     api_key = os.environ.get("MISTRAL_API_KEY")
     if api_key:
@@ -80,17 +83,13 @@ def _google_credentials():
             fh.write(raw)
             path = fh.name
         try:
-            return service_account.Credentials.from_service_account_file(
-                path, scopes=[DRIVE_SCOPE]
-            )
+            return service_account.Credentials.from_service_account_file(path, scopes=[DRIVE_SCOPE])
         finally:
             os.unlink(path)
 
     path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if path and os.path.exists(path):
-        return service_account.Credentials.from_service_account_file(
-            path, scopes=[DRIVE_SCOPE]
-        )
+        return service_account.Credentials.from_service_account_file(path, scopes=[DRIVE_SCOPE])
     return None
 
 
@@ -100,39 +99,62 @@ def _drive_filename(note_id: str) -> str:
     return f"tts_{safe or 'note'}.mp3"
 
 
-def _upload_to_drive(mp3_b64: str, filename: str, folder_id: str, creds: Any) -> str:
-    """Televerse le MP3 dans le dossier Drive et retourne l'identifiant du fichier."""
+def _upload_to_drive(mp3_b64: str, filename: str, folder_id: str, owner_email: str | None, creds: Any) -> str:
+    """Cree le MP3 dans le dossier Drive et retourne l'identifiant du fichier.
+
+    Sequence imposee par l'absence de quota des comptes de service :
+    1. creation d'un fichier vide (0 octet, aucun quota requis),
+    2. partage en ecriture, puis transfert de propriete a owner_email,
+    3. chargement du contenu audio (compte sur le quota du proprietaire).
+    """
     import base64
 
     from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaInMemoryUpload
 
     service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    media = MediaInMemoryUpload(base64.b64decode(mp3_b64), mimetype=MP3_MIME)
-    file_metadata = {"name": filename, "parents": [folder_id]}
     created = (
         service.files()
-        .create(body=file_metadata, media_body=media, fields="id", supportsAllDrives=True)
+        .create(body={"name": filename, "parents": [folder_id]}, fields="id", supportsAllDrives=True)
         .execute()
     )
-    return created["id"]
+    file_id = created["id"]
+
+    if owner_email:
+        service.permissions().create(
+            fileId=file_id,
+            body={"type": "user", "role": "writer", "emailAddress": owner_email},
+            supportsAllDrives=True,
+        ).execute()
+        try:
+            service.permissions().create(
+                fileId=file_id,
+                body={"type": "user", "role": "owner", "emailAddress": owner_email},
+                transferOwnership=True,
+                supportsAllDrives=True,
+            ).execute()
+        except HttpError as err:
+            logger.warning("Transfert de propriete impossible (%s) : le fichier reste au compte de service", err)
+
+    media = MediaInMemoryUpload(base64.b64decode(mp3_b64), mimetype=MP3_MIME)
+    service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+    return file_id
 
 
 @workflows.activity()
-async def resolve_upload_mode(folder_id: str | None) -> str | None:
-    """Retourne le dossier Drive si l'upload est possible, sinon None.
+async def resolve_upload_mode(folder_id: str | None, owner_email: str | None) -> "tuple[str | None, str | None]":
+    """Retourne (folder_id, owner_email) si l'upload est possible, sinon (None, None).
 
     Doit rester une ACTIVITE : elle lit l'environnement et importe la
     librairie Google, ce que le sandbox deterministe du workflow interdit.
     """
     if not folder_id:
-        return None
+        return None, None
     if _google_credentials() is None:
-        logger.warning(
-            "drive_folder_id fourni mais credentials Google absents : sortie base64"
-        )
-        return None
-    return folder_id
+        logger.warning("drive_folder_id fourni mais credentials Google absents : sortie base64")
+        return None, None
+    return folder_id, owner_email
 
 
 @workflows.activity()
@@ -152,13 +174,13 @@ async def synthesize_note(note: NoteIn, voice_id: str, model: str) -> AudioOut:
 
 
 @workflows.activity()
-async def upload_note(audio: AudioOut, folder_id: str) -> AudioOut:
+async def upload_note(audio: AudioOut, folder_id: str, owner_email: str | None) -> AudioOut:
     """Televerse le MP3 dans le dossier Drive et retourne la sortie legere."""
     creds = _google_credentials()
     if creds is None:
         raise RuntimeError("Credentials Google absents : impossible de televerser sur Drive")
     filename = _drive_filename(audio.id)
-    drive_file_id = _upload_to_drive(audio.mp3_base64, filename, folder_id, creds)
+    drive_file_id = _upload_to_drive(audio.mp3_base64, filename, folder_id, owner_email, creds)
     logger.info("MP3 televerse : %s (drive_file_id=%s)", filename, drive_file_id)
     return AudioOut(
         id=audio.id, filename=filename, drive_file_id=drive_file_id, chars=audio.chars
@@ -174,13 +196,13 @@ class TTSNotesWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, input: TTSNotesInput) -> "list[AudioOut]":
         # Le mode Drive se resout via une ACTIVITE (imports/env interdits dans le workflow).
-        target_folder: str | None = await resolve_upload_mode(input.drive_folder_id)
+        target_folder, owner_email = await resolve_upload_mode(input.drive_folder_id, input.owner_email)
 
         results: list[AudioOut] = []
         for note in input.notes:
             audio = await synthesize_note(note, input.voice_id, input.model)
             if target_folder:
-                uploaded = await upload_note(audio, target_folder)
+                uploaded = await upload_note(audio, target_folder, owner_email)
                 # Ne pas renvoyer le base64 dans le resultat (economie de taille)
                 results.append(
                     AudioOut(
