@@ -6,20 +6,18 @@ reste la propriete du compte client, le contenu compte sur SON quota :
 c'est la sequence qui fonctionne avec un compte de service (qui n'a aucun
 quota Drive et ne peut ni creer du contenu ni le posseder).
 
-Une activite de nettoyage supprime aussi, dans le dossier cible, les
-anciens fichiers tts_* appartenant au compte de service (epaves des
-essais precedents, 0 octet).
-
-Entree : la voix (voice_id Voxtral), une liste de notes (id + texte deja
-verbalise), drive_folder_id (dossier Drive cible) et owner_email
-(proprietaire des fichiers pre-crees).
-Sortie : par note {id, filename, drive_file_id, chars}, ou {id, mp3_base64,
-chars} en mode retrocompatible (sans drive_folder_id).
+Version v5 : mode splice. Si l'entree contient html_file_id, le worker
+telecharge le fichier HTML pre-uploade sur Drive, lit les MP3 tts_* du
+dossier proprietaire, les concatene, et remplace le marqueur /__PA__/ par
+la data URI audio en base64, puis met a jour le fichier Drive. Aucune
+synthese TTS n'est relancee dans ce mode (cout nul).
 """
 
+import io
 import logging
 from typing import Any
 
+from googleapiclient.http import MediaIoBaseDownload
 from pydantic import BaseModel, Field
 
 import mistralai.workflows as workflows
@@ -30,6 +28,8 @@ DEFAULT_MODEL = "voxtral-mini-tts-3-0"
 DEFAULT_VOICE = "voice_592"  # Marie (fr), voix Voxtral 3
 MP3_MIME = "audio/mpeg"
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+HTML_MIME = "text/html"
+AUDIO_MARKER = "/__PA__/"
 
 
 class NoteIn(BaseModel):
@@ -38,13 +38,17 @@ class NoteIn(BaseModel):
 
 
 class TTSNotesInput(BaseModel):
-    notes: list[NoteIn]
+    notes: list[NoteIn] = Field(default_factory=list)
     voice_id: str = Field(default=DEFAULT_VOICE, description="Identifiant de la voix Voxtral")
     model: str = Field(default=DEFAULT_MODEL, description="Modele TTS")
     drive_folder_id: str | None = Field(default=None)
     owner_email: str | None = Field(
         default=None,
         description="Proprietaire Drive des fichiers MP3 pre-crees (le compte de service n'est qu'un editeur).",
+    )
+    html_file_id: str | None = Field(
+        default=None,
+        description="Si fourni : mode splice, injection des MP3 tts_* du dossier dans ce fichier HTML Drive (marqueur /__PA__/). Aucune synthese relancee.",
     )
 
 
@@ -58,6 +62,13 @@ class AudioOut(BaseModel):
 
 class CleanupOut(BaseModel):
     removed: int = 0
+
+
+class SpliceOut(BaseModel):
+    html_file_id: str
+    slides: int
+    audio_bytes: int
+    html_chars: int
 
 
 def _make_client():
@@ -128,6 +139,17 @@ def _list_tts_files(service: Any, folder_id: str):
             return files
 
 
+def _download_media(service: Any, file_id: str) -> bytes:
+    """Telecharge le contenu binaire d'un fichier Drive."""
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _status, done = downloader.next_chunk()
+    return buf.getvalue()
+
+
 @workflows.activity()
 async def resolve_upload_mode(folder_id: str | None, owner_email: str | None) -> "tuple[str | None, str | None]":
     """Retourne (folder_id, owner_email) si l'upload est possible, sinon (None, None).
@@ -159,7 +181,7 @@ async def cleanup_folder(folder_id: str, owner_email: str) -> CleanupOut:
             service.files().delete(fileId=f["id"], supportsAllDrives=True).execute()
             logger.info("Fichier epave supprime : %s (%s)", f["name"], owner)
             removed += 1
-    return CleanupOut(removed=removed)
+    return CleanupOut(removed)
 
 
 @workflows.activity()
@@ -212,14 +234,87 @@ async def upload_note(audio: AudioOut, folder_id: str, owner_email: str) -> Audi
     )
 
 
+@workflows.activity()
+async def splice_audio(html_file_id: str, folder_id: str, owner_email: str) -> SpliceOut:
+    """Injecte les MP3 tts_* du dossier dans le fichier HTML Drive.
+
+    Telecharge le HTML, concatene les MP3 du proprietaire (tri par nom),
+    encode en base64, remplace le marqueur AUDIO_MARKER, met a jour le
+    fichier Drive. Tout reste dans cette activite : aucun base64 volumineux
+    ne transite par l'historique du workflow.
+    """
+    import base64
+
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaInMemoryUpload
+
+    creds = _google_credentials()
+    if creds is None:
+        raise RuntimeError("Credentials Google absents")
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    html_bytes = _download_media(service, html_file_id)
+    html = html_bytes.decode("utf-8")
+
+    targets = []
+    for f in _list_tts_files(service, folder_id):
+        if not f.get("name", "").endswith(".mp3"):
+            continue
+        owners = f.get("owners", [])
+        owner = owners[0].get("emailAddress", "") if owners else ""
+        if owner == owner_email and int(f.get("size", "0")) > 0:
+            targets.append((f["name"], f["id"], int(f.get("size", "0"))))
+    targets.sort(key=lambda t: t[0])
+    if len(targets) < 2:
+        raise RuntimeError(f"Moins de 2 MP3 valides trouves dans {folder_id} pour {owner_email}")
+
+    audio = b""
+    for name, fid, size in targets:
+        chunk = _download_media(service, fid)
+        if len(chunk) != size:
+            raise RuntimeError(f"Taille inattendue pour {name}: {len(chunk)} != {size}")
+        audio += chunk
+        logger.info("MP3 lu : %s (%d octets)", name, size)
+
+    audio_b64 = base64.b64encode(audio).decode("ascii")
+    data_uri = f"data:audio/mpeg;base64,{audio_b64}"
+    if AUDIO_MARKER not in html:
+        raise RuntimeError(f"Marqueur {AUDIO_MARKER} introuvable dans le HTML {html_file_id}")
+    html_final = html.replace(AUDIO_MARKER, data_uri)
+    if AUDIO_MARKER in html_final:
+        raise RuntimeError("Marqueur toujours present apres remplacement")
+
+    media = MediaInMemoryUpload(html_final.encode("utf-8"), mimetype=HTML_MIME)
+    service.files().update(fileId=html_file_id, media_body=media, supportsAllDrives=True).execute()
+    logger.info(
+        "HTML mis a jour : %d MP3, %d octets audio, %d caracteres",
+        len(targets), len(audio), len(html_final),
+    )
+    return SpliceOut(
+        html_file_id=html_file_id,
+        slides=len(targets),
+        audio_bytes=len(audio),
+        html_chars=len(html_final),
+    )
+
+
 @workflows.workflow.define(
     name="tts-notes-deck",
     workflow_display_name="TTS Notes de Deck",
-    workflow_description="Genere un fichier MP3 par note de presentation, avec la voix Voxtral choisie. Les MP3 sont charges dans des fichiers Drive pre-crees par le proprietaire du dossier.",
+    workflow_description="Genere un fichier MP3 par note de presentation, avec la voix Voxtral choisie. Les MP3 sont charges dans des fichiers Drive pre-crees par le proprietaire du dossier. Mode splice : injecte les MP3 existants dans un fichier HTML Drive.",
 )
 class TTSNotesWorkflow:
     @workflows.workflow.entrypoint
-    async def run(self, input: TTSNotesInput) -> "list[AudioOut]":
+    async def run(self, input: TTSNotesInput) -> "AudioOut | SpliceOut | list[AudioOut]":
+        # Mode splice : injection audio dans un HTML Drive, sans TTS.
+        if input.html_file_id:
+            target_folder, owner_email = await resolve_upload_mode(
+                input.drive_folder_id, input.owner_email
+            )
+            if not target_folder or not owner_email:
+                raise RuntimeError("drive_folder_id et owner_email requis pour le mode splice")
+            return await splice_audio(input.html_file_id, target_folder, owner_email)
+
         target_folder, owner_email = await resolve_upload_mode(input.drive_folder_id, input.owner_email)
 
         if not target_folder:
@@ -230,7 +325,7 @@ class TTSNotesWorkflow:
 
         await cleanup_folder(target_folder, owner_email)
 
-        results: list[AudioOut] = []
+        results = []
         for note in input.notes:
             audio = await synthesize_note(note, input.voice_id, input.model)
             results.append(await upload_note(audio, target_folder, owner_email))
