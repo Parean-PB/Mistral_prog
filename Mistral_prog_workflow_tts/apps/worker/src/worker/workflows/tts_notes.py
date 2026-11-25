@@ -1,17 +1,18 @@
 """Workflow tts-notes-deck : transforme les notes de presentation en fichiers MP3.
 
-Version Drive : si l'entree contient un drive_folder_id et que le worker
-dispose des credentials Google (GOOGLE_APPLICATION_CREDENTIALS_JSON ou
-GOOGLE_APPLICATION_CREDENTIALS), chaque MP3 est televerse directement dans
-ce dossier Drive et le resultat ne contient plus de base64 (leger).
+Version Drive (v4) : le worker met a jour des fichiers MP3 PRE-CREES dans
+Drive par le proprietaire du dossier (via le connecteur Drive). Le fichier
+reste la propriete du compte client, le contenu compte sur SON quota :
+c'est la sequence qui fonctionne avec un compte de service (qui n'a aucun
+quota Drive et ne peut ni creer du contenu ni le posseder).
 
-Un compte de service Google n'a aucun quota Drive : le fichier est donc
-cree vide, la propriete est transferee a owner_email (qui doit avoir acces
-au dossier), PUIS le contenu audio est charge (quota du vrai proprietaire).
+Une activite de nettoyage supprime aussi, dans le dossier cible, les
+anciens fichiers tts_* appartenant au compte de service (epaves des
+essais precedents, 0 octet).
 
 Entree : la voix (voice_id Voxtral), une liste de notes (id + texte deja
 verbalise), drive_folder_id (dossier Drive cible) et owner_email
-(proprietaire Drive final des MP3).
+(proprietaire des fichiers pre-crees).
 Sortie : par note {id, filename, drive_file_id, chars}, ou {id, mp3_base64,
 chars} en mode retrocompatible (sans drive_folder_id).
 """
@@ -43,7 +44,7 @@ class TTSNotesInput(BaseModel):
     drive_folder_id: str | None = Field(default=None)
     owner_email: str | None = Field(
         default=None,
-        description="Compte Drive a qui transferer la propriete des MP3 (un compte de service n'a aucun quota).",
+        description="Proprietaire Drive des fichiers MP3 pre-crees (le compte de service n'est qu'un editeur).",
     )
 
 
@@ -53,6 +54,10 @@ class AudioOut(BaseModel):
     filename: str = ""
     drive_file_id: str = ""
     chars: int
+
+
+class CleanupOut(BaseModel):
+    removed: int = 0
 
 
 def _make_client():
@@ -99,47 +104,28 @@ def _drive_filename(note_id: str) -> str:
     return f"tts_{safe or 'note'}.mp3"
 
 
-def _upload_to_drive(mp3_b64: str, filename: str, folder_id: str, owner_email: str | None, creds: Any) -> str:
-    """Cree le MP3 dans le dossier Drive et retourne l'identifiant du fichier.
-
-    Sequence imposee par l'absence de quota des comptes de service :
-    1. creation d'un fichier vide (0 octet, aucun quota requis),
-    2. partage en ecriture, puis transfert de propriete a owner_email,
-    3. chargement du contenu audio (compte sur le quota du proprietaire).
-    """
-    import base64
-
-    from googleapiclient.discovery import build
-    from googleapiclient.errors import HttpError
-    from googleapiclient.http import MediaInMemoryUpload
-
-    service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    created = (
-        service.files()
-        .create(body={"name": filename, "parents": [folder_id]}, fields="id", supportsAllDrives=True)
-        .execute()
-    )
-    file_id = created["id"]
-
-    if owner_email:
-        service.permissions().create(
-            fileId=file_id,
-            body={"type": "user", "role": "writer", "emailAddress": owner_email},
-            supportsAllDrives=True,
-        ).execute()
-        try:
-            service.permissions().create(
-                fileId=file_id,
-                body={"type": "user", "role": "owner", "emailAddress": owner_email},
-                transferOwnership=True,
+def _list_tts_files(service: Any, folder_id: str):
+    """Liste les fichiers tts_* du dossier avec leur proprietaire."""
+    files = []
+    token = None
+    while True:
+        res = (
+            service.files()
+            .list(
+                q=f"parents='{folder_id}' and trashed=false",
+                fields="nextPageToken, files(id, name, size, owners(emailAddress))",
+                pageToken=token,
                 supportsAllDrives=True,
-            ).execute()
-        except HttpError as err:
-            logger.warning("Transfert de propriete impossible (%s) : le fichier reste au compte de service", err)
-
-    media = MediaInMemoryUpload(base64.b64decode(mp3_b64), mimetype=MP3_MIME)
-    service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
-    return file_id
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
+        for f in res.get("files", []):
+            if f.get("name", "").startswith("tts_"):
+                files.append(f)
+        token = res.get("nextPageToken")
+        if not token:
+            return files
 
 
 @workflows.activity()
@@ -149,12 +135,31 @@ async def resolve_upload_mode(folder_id: str | None, owner_email: str | None) ->
     Doit rester une ACTIVITE : elle lit l'environnement et importe la
     librairie Google, ce que le sandbox deterministe du workflow interdit.
     """
-    if not folder_id:
+    if not folder_id or not owner_email:
         return None, None
     if _google_credentials() is None:
-        logger.warning("drive_folder_id fourni mais credentials Google absents : sortie base64")
+        logger.warning("credentials Google absents : sortie base64")
         return None, None
     return folder_id, owner_email
+
+
+@workflows.activity()
+async def cleanup_folder(folder_id: str, owner_email: str) -> CleanupOut:
+    """Supprime du dossier les fichiers tts_* qui n'appartiennent PAS au
+    proprietaire (epaves 0 octet creees par le compte de service)."""
+    from googleapiclient.discovery import build
+
+    creds = _google_credentials()
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    removed = 0
+    for f in _list_tts_files(service, folder_id):
+        owners = f.get("owners", [])
+        owner = owners[0].get("emailAddress", "") if owners else ""
+        if owner and owner != owner_email:
+            service.files().delete(fileId=f["id"], supportsAllDrives=True).execute()
+            logger.info("Fichier epave supprime : %s (%s)", f["name"], owner)
+            removed += 1
+    return CleanupOut(removed=removed)
 
 
 @workflows.activity()
@@ -174,45 +179,59 @@ async def synthesize_note(note: NoteIn, voice_id: str, model: str) -> AudioOut:
 
 
 @workflows.activity()
-async def upload_note(audio: AudioOut, folder_id: str, owner_email: str | None) -> AudioOut:
-    """Televerse le MP3 dans le dossier Drive et retourne la sortie legere."""
+async def upload_note(audio: AudioOut, folder_id: str, owner_email: str) -> AudioOut:
+    """Charge le MP3 dans le fichier pre-cree (proprietaire : owner_email)."""
+    import base64
+
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaInMemoryUpload
+
     creds = _google_credentials()
     if creds is None:
-        raise RuntimeError("Credentials Google absents : impossible de televerser sur Drive")
+        raise RuntimeError("Credentials Google absents")
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
     filename = _drive_filename(audio.id)
-    drive_file_id = _upload_to_drive(audio.mp3_base64, filename, folder_id, owner_email, creds)
-    logger.info("MP3 televerse : %s (drive_file_id=%s)", filename, drive_file_id)
+
+    target = None
+    for f in _list_tts_files(service, folder_id):
+        if f.get("name") == filename:
+            owners = f.get("owners", [])
+            if owners and owners[0].get("emailAddress") == owner_email:
+                target = f["id"]
+                break
+    if target is None:
+        raise RuntimeError(
+            f"Fichier pre-cree introuvable : {filename} (proprietaire {owner_email}) dans le dossier {folder_id}"
+        )
+
+    media = MediaInMemoryUpload(base64.b64decode(audio.mp3_base64), mimetype=MP3_MIME)
+    service.files().update(fileId=target, media_body=media, supportsAllDrives=True).execute()
+    logger.info("MP3 charge dans %s (drive_file_id=%s)", filename, target)
     return AudioOut(
-        id=audio.id, filename=filename, drive_file_id=drive_file_id, chars=audio.chars
+        id=audio.id, filename=filename, drive_file_id=target, chars=audio.chars
     )
 
 
 @workflows.workflow.define(
     name="tts-notes-deck",
     workflow_display_name="TTS Notes de Deck",
-    workflow_description="Genere un fichier MP3 par note de presentation, avec la voix Voxtral choisie. Televerse directement sur Google Drive quand drive_folder_id est fourni.",
+    workflow_description="Genere un fichier MP3 par note de presentation, avec la voix Voxtral choisie. Les MP3 sont charges dans des fichiers Drive pre-crees par le proprietaire du dossier.",
 )
 class TTSNotesWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, input: TTSNotesInput) -> "list[AudioOut]":
-        # Le mode Drive se resout via une ACTIVITE (imports/env interdits dans le workflow).
         target_folder, owner_email = await resolve_upload_mode(input.drive_folder_id, input.owner_email)
+
+        if not target_folder:
+            results: list[AudioOut] = []
+            for note in input.notes:
+                results.append(await synthesize_note(note, input.voice_id, input.model))
+            return results
+
+        await cleanup_folder(target_folder, owner_email)
 
         results: list[AudioOut] = []
         for note in input.notes:
             audio = await synthesize_note(note, input.voice_id, input.model)
-            if target_folder:
-                uploaded = await upload_note(audio, target_folder, owner_email)
-                # Ne pas renvoyer le base64 dans le resultat (economie de taille)
-                results.append(
-                    AudioOut(
-                        id=uploaded.id,
-                        filename=uploaded.filename,
-                        drive_file_id=uploaded.drive_file_id,
-                        chars=uploaded.chars,
-                    )
-                )
-            else:
-                # Base64 par defaut pour l'existant
-                results.append(audio)
+            results.append(await upload_note(audio, target_folder, owner_email))
         return results
