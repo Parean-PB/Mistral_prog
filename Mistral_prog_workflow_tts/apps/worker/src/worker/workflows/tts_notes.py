@@ -49,6 +49,10 @@ class TTSNotesInput(BaseModel):
         default=None,
         description="Si fourni : mode splice, injection des MP3 tts_* du dossier dans ce fichier HTML Drive (marqueur /__PA__/). Aucune synthese relancee.",
     )
+    audio_file_ids: list[str] = Field(
+        default_factory=list,
+        description="Mode splice : identifiants Drive des MP3 dans l'ordre (prioritaire sur le listing du dossier).",
+    )
 
 
 class AudioOut(BaseModel):
@@ -236,7 +240,7 @@ async def upload_note(audio: AudioOut, folder_id: str, owner_email: str) -> Audi
 
 
 @workflows.activity()
-async def splice_audio(html_file_id: str, folder_id: str, owner_email: str) -> SpliceOut:
+async def splice_audio(html_file_id: str, folder_id: str, owner_email: str, audio_file_ids: list[str]) -> SpliceOut:
     """Injecte les MP3 tts_* du dossier dans le fichier HTML Drive.
 
     Telecharge le HTML, concatene les MP3 du proprietaire (tri par nom),
@@ -258,16 +262,39 @@ async def splice_audio(html_file_id: str, folder_id: str, owner_email: str) -> S
     html = html_bytes.decode("utf-8")
 
     targets = []
-    for f in _list_tts_files(service, folder_id):
-        if not f.get("name", "").endswith(".mp3"):
-            continue
-        owners = f.get("owners", [])
-        owner = owners[0].get("emailAddress", "") if owners else ""
-        if owner == owner_email and int(f.get("size", "0")) > 0:
-            targets.append((f["name"], f["id"], int(f.get("size", "0"))))
-    targets.sort(key=lambda t: t[0])
+    seen = []
+
+    if audio_file_ids:
+        # Identifiants explicites fiables (contourne l'index de recherche Drive)
+        for fid in audio_file_ids:
+            meta = (
+                service.files()
+                .get(fileId=fid, fields="id, name, size, owners(emailAddress)", supportsAllDrives=True)
+                .execute()
+            )
+            owners = meta.get("owners", [])
+            owner = owners[0].get("emailAddress", "") if owners else ""
+            size_s = meta.get("size") or "0"
+            seen.append((meta.get("name", "?"), size_s, owner))
+            if meta.get("name", "").endswith(".mp3") and owner == owner_email and int(size_s) > 0:
+                targets.append((meta["name"], fid, int(size_s)))
+        targets.sort(key=lambda t: t[0])
+    else:
+        for f in _list_tts_files(service, folder_id):
+            owners = f.get("owners", [])
+            owner = owners[0].get("emailAddress", "") if owners else ""
+            seen.append((f.get("name", "?"), f.get("size", "?"), owner))
+            name_s = f.get("name", "")
+            size_s = f.get("size") or "0"
+            if name_s.endswith(".mp3") and owner == owner_email and int(size_s) > 0:
+                targets.append((name_s, f["id"], int(size_s)))
+        targets.sort(key=lambda t: t[0])
+
+    logger.info("MP3 vus (%d) : %s", len(seen), seen)
     if len(targets) < 2:
-        raise RuntimeError(f"Moins de 2 MP3 valides trouves dans {folder_id} pour {owner_email}")
+        raise RuntimeError(
+            f"Moins de 2 MP3 valides ({len(targets)}) trouves pour {owner_email} ; vus={seen[:25]}"
+        )
 
     audio = b""
     for name, fid, size in targets:
@@ -314,7 +341,7 @@ class TTSNotesWorkflow:
             )
             if not target_folder or not owner_email:
                 raise RuntimeError("drive_folder_id et owner_email requis pour le mode splice")
-            spliced = await splice_audio(input.html_file_id, target_folder, owner_email)
+            spliced = await splice_audio(input.html_file_id, target_folder, owner_email, input.audio_file_ids)
             return [AudioOut(id="splice", filename=f"{spliced.slides} mp3", drive_file_id=spliced.html_file_id, chars=spliced.html_chars)]
 
         target_folder, owner_email = await resolve_upload_mode(input.drive_folder_id, input.owner_email)
