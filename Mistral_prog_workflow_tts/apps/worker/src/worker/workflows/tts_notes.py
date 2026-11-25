@@ -48,7 +48,8 @@ class TTSNotesInput(BaseModel):
     )
     html_file_id: str | None = Field(
         default=None,
-        description="Si fourni : mode splice, injection des MP3 tts_* du dossier dans ce fichier HTML Drive (marqueur /__PA__/). Aucune synthese relancee.",
+        description="Si fourni : mode splice, inject
+ion des MP3 tts_* du dossier dans ce fichier HTML Drive (marqueur /__PA__/). Aucune synthese relancee.",
     )
 
 
@@ -119,7 +120,8 @@ def _list_tts_files(service: Any, folder_id: str):
     """Liste les fichiers tts_* du dossier avec leur proprietaire."""
     files = []
     token = None
-    while True:
+    wh
+ile True:
         res = (
             service.files()
             .list(
@@ -173,7 +175,8 @@ async def cleanup_folder(folder_id: str, owner_email: str) -> CleanupOut:
 
     creds = _google_credentials()
     service = build("drive", "v3", credentials=creds, cache_discovery=False)
-    removed = 0
+ 
+   removed = 0
     for f in _list_tts_files(service, folder_id):
         owners = f.get("owners", [])
         owner = owners[0].get("emailAddress", "") if owners else ""
@@ -226,7 +229,8 @@ async def upload_note(audio: AudioOut, folder_id: str, owner_email: str) -> Audi
             f"Fichier pre-cree introuvable : {filename} (proprietaire {owner_email}) dans le dossier {folder_id}"
         )
 
-    media = MediaInMemoryUpload(base64.b64decode(audio.mp3_base64), mimetype=MP3_MIME)
+    media = MediaI
+nMemoryUpload(base64.b64decode(audio.mp3_base64), mimetype=MP3_MIME)
     service.files().update(fileId=target, media_body=media, supportsAllDrives=True).execute()
     logger.info("MP3 charge dans %s (drive_file_id=%s)", filename, target)
     return AudioOut(
@@ -274,7 +278,8 @@ async def splice_audio(html_file_id: str, folder_id: str, owner_email: str) -> S
         if len(chunk) != size:
             raise RuntimeError(f"Taille inattendue pour {name}: {len(chunk)} != {size}")
         audio += chunk
-        logger.info("MP3 lu : %s (%d octets)", name, size)
+  
+      logger.info("MP3 lu : %s (%d octets)", name, size)
 
     audio_b64 = base64.b64encode(audio).decode("ascii")
     data_uri = f"data:audio/mpeg;base64,{audio_b64}"
@@ -305,7 +310,7 @@ async def splice_audio(html_file_id: str, folder_id: str, owner_email: str) -> S
 )
 class TTSNotesWorkflow:
     @workflows.workflow.entrypoint
-    async def run(self, input: TTSNotesInput) -> "AudioOut | SpliceOut | list[AudioOut]":
+    async def run(self, input: TTSNotesInput) -> "list[AudioOut]":
         # Mode splice : injection audio dans un HTML Drive, sans TTS.
         if input.html_file_id:
             target_folder, owner_email = await resolve_upload_mode(
@@ -313,9 +318,11 @@ class TTSNotesWorkflow:
             )
             if not target_folder or not owner_email:
                 raise RuntimeError("drive_folder_id et owner_email requis pour le mode splice")
-            return await splice_audio(input.html_file_id, target_folder, owner_email)
+            spliced = await splice_audio(input.html_file_id, target_folder, owner_email)
+            return [AudioOut(id="splice", filename=f"{spliced.slides} mp3", drive_file_id=spliced.html_file_id, chars=spliced.html_chars)]
 
-        target_folder, owner_email = await resolve_upload_mode(input.drive_folder_id, input.owner_email)
+        target_folder, owner_email = await resolve_upload_mode(inp
+ut.drive_folder_id, input.owner_email)
 
         if not target_folder:
             results: list[AudioOut] = []
