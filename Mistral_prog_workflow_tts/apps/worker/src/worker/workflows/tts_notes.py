@@ -296,19 +296,33 @@ async def splice_audio(html_file_id: str, folder_id: str, owner_email: str, audi
             f"Moins de 2 MP3 valides ({len(targets)}) trouves pour {owner_email} ; vus={seen[:25]}"
         )
 
-    audio = b""
+    chunks = []
     for name, fid, size in targets:
         chunk = _download_media(service, fid)
         if len(chunk) != size:
             raise RuntimeError(f"Taille inattendue pour {name}: {len(chunk)} != {size}")
-        audio += chunk
+        chunks.append(chunk)
         logger.info("MP3 lu : %s (%d octets)", name, size)
+    audio = b"".join(chunks)
+
+    import json as _json
 
     audio_b64 = base64.b64encode(audio).decode("ascii")
     data_uri = f"data:audio/mpeg;base64,{audio_b64}"
-    if AUDIO_MARKER not in html:
+    quoted_marker = '"' + AUDIO_MARKER + '"'
+    if quoted_marker in html:
+        # deck "une piste par diapo" : injection d'un tableau JS des MP3
+        payload = _json.dumps(
+            [
+                "data:audio/mpeg;base64," + base64.b64encode(c).decode("ascii")
+                for c in chunks
+            ]
+        )
+        html_final = html.replace(quoted_marker, payload)
+    elif AUDIO_MARKER in html:
+        html_final = html.replace(AUDIO_MARKER, data_uri)
+    else:
         raise RuntimeError(f"Marqueur {AUDIO_MARKER} introuvable dans le HTML {html_file_id}")
-    html_final = html.replace(AUDIO_MARKER, data_uri)
     if AUDIO_MARKER in html_final:
         raise RuntimeError("Marqueur toujours present apres remplacement")
 
