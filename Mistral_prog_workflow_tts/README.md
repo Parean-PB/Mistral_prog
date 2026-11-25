@@ -24,7 +24,7 @@ Voxtral TTS (`voxtral-mini-tts-3-0`).
   MP3 (`tts_<id>.mp3`). La sortie est alors legere :
   `[{ id, filename, drive_file_id, chars }]`.
 - Sans `drive_folder_id`, comportement retrocompatible : la sortie contient
-  un MP3 encode en base64 par note (PeASANT a eviter, volumineux).
+  un MP3 encode en base64 par note (volumineux, a eviter).
 
 Les textes doivent etre prets a etre parles (chiffres en toutes lettres,
 sigles epelles, pas de markdown ni de caracteres speciaux).
