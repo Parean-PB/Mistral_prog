@@ -4,7 +4,8 @@ WORKDIR /app
 
 # Le worker managed lit le token de service-account injecte par la plateforme
 # (MISTRAL_SA_TOKEN_PATH) : aucune cle API n'est embarquee dans l'image.
-RUN pip install --no-cache-dir "mistralai-workflows>=3.10" "mistralai>=3.0" "pydantic>=2.10"
+# google-auth + google-api-python-client : upload Google Drive natif (MP3 de tts-notes-deck).
+RUN pip install --no-cache-dir "mistralai-workflows>=3.10" "mistralai>=3.0" "pydantic>=2.10" "google-auth>=2.0" "google-api-python-client>=2.0"
 
 COPY apps/worker/src ./src
 

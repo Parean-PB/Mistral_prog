@@ -1,10 +1,12 @@
 [project]
 name = "mistral-prog"
-version = "0.1.0"
+version = "0.2.0"
 description = "Workflows Mistral pour l'infrastructure Vibe de Parean Biotechnologies (synthese vocale des decks, etc.)"
 requires-python = ">=3.12"
 dependencies = [
     "mistralai-workflows>=3.10",
     "mistralai>=3.0",
     "pydantic>=2.10",
+    "google-auth>=2.0",
+    "google-api-python-client>=2.0",
 ]
