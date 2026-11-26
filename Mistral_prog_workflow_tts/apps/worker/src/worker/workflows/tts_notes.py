@@ -186,7 +186,7 @@ async def cleanup_folder(folder_id: str, owner_email: str) -> CleanupOut:
             service.files().delete(fileId=f["id"], supportsAllDrives=True).execute()
             logger.info("Fichier epave supprime : %s (%s)", f["name"], owner)
             removed += 1
-    return CleanupOut(removed)
+    return CleanupOut(removed=removed)
 
 
 @workflows.activity()
